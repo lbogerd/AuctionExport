@@ -1,0 +1,17 @@
+{
+  "files.eol": "\n",
+  "editor.formatOnSave": true,
+  "editor.tabSize": 2,
+  "editor.insertSpaces": true,
+
+  "Lua.runtime.version": "Lua 5.1",
+  "Lua.diagnostics.globals": [
+    "C_AuctionHouse",
+    "CreateFrame",
+    "UIParent",
+    "SlashCmdList",
+    "date",
+    "print"
+  ],
+  "Lua.workspace.checkThirdParty": false
+}
