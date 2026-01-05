@@ -1,0 +1,10 @@
+## Interface: 110207, 120000
+## Title: AuctionExport
+## Notes: Auction House export tooling
+## Author: Me
+## Version: 0.1
+## SavedVariables: AuctionExportDB
+## X-Category: Auction/Economy
+## Category-enUS: Auctions
+
+AuctionExport.lua
