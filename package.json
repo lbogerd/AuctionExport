@@ -1,0 +1,17 @@
+{
+  "name": "auction-export",
+  "version": "1.0.0",
+  "description": "",
+  "type": "module",
+  "scripts": {
+    "start": "node --experimental-strip-types ./process.ts"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "packageManager": "pnpm@10.26.0",
+  "devDependencies": {
+    "typescript": "5.9.3",
+    "@types/node": "25.0.3"
+  }
+}
