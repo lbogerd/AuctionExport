@@ -29,6 +29,8 @@ local function getSettings()
   if settings.enrichOverallMaxRequests == nil then settings.enrichOverallMaxRequests = 20000 end
   -- Whether to automatically enrich after a read.
   if settings.autoEnrich == nil then settings.autoEnrich = true end
+  -- Delay before the final cache-only enrich pass (helps catch late item cache fills).
+  if settings.finalEnrichDelaySec == nil then settings.finalEnrichDelaySec = 1 end
   return settings
 end
 
@@ -566,6 +568,65 @@ local function startEnrichJob(rows, onDone)
   C_Timer.After(0, tickEnrichJob)
 end
 
+local function finalCacheOnlyEnrichPass(rows)
+  if not rows or #rows == 0 then
+    return { rowsUpdated = 0, remainingRowsMissing = 0, distinctItemsMissing = 0 }
+  end
+
+  local itemCache = {}
+  local rowsUpdated = 0
+  local remainingRowsMissing = 0
+  local distinctItemsMissing = 0
+  local missingItemsSeen = {}
+
+  for i = 1, #rows do
+    local r = rows[i]
+    if r and rowNeedsEnrich(r) then
+      local itemId = r.itemId
+      if itemId and itemId > 0 then
+        local cached = itemCache[itemId]
+        if not cached then
+          local name, link, quality = GetItemInfo(itemId)
+          cached = { name = name, link = link, quality = quality }
+          itemCache[itemId] = cached
+        end
+
+        local changed = false
+        if (r.name == nil or r.name == "") and cached.name and cached.name ~= "" then
+          r.name = cached.name
+          changed = true
+        end
+        if (r.itemLink == nil or r.itemLink == "") and cached.link and cached.link ~= "" then
+          r.itemLink = cached.link
+          changed = true
+        end
+        if (r.quality == nil or r.quality == -1) and cached.quality ~= nil then
+          r.quality = cached.quality
+          changed = true
+        end
+
+        if changed then
+          rowsUpdated = rowsUpdated + 1
+        end
+      end
+
+      if rowNeedsEnrich(r) then
+        remainingRowsMissing = remainingRowsMissing + 1
+        if r.itemId and r.itemId > 0 and not missingItemsSeen[r.itemId] then
+          missingItemsSeen[r.itemId] = true
+          distinctItemsMissing = distinctItemsMissing + 1
+        end
+      end
+    end
+  end
+
+  return {
+    rowsUpdated = rowsUpdated,
+    remainingRowsMissing = remainingRowsMissing,
+    distinctItemsMissing = distinctItemsMissing,
+  }
+end
+
 local function tickReadJob()
   local job = activeJob
   if not job or job.kind ~= "read" then return end
@@ -723,13 +784,38 @@ local function continuePipelineAfterRead(rows)
   maybePrintProgress(job, true)
 
   startEnrichJob(rows, function(_ok)
-    local pj = activeJob
-    -- If enrich created its own job, pipeline job was replaced.
-    -- We'll just finalize from SavedVariables.
-    local scan = AuctionExportDB.lastScan
-    local count = 0
-    if scan and scan.rows then count = #scan.rows end
-    print(ADDON .. ": Export complete (" .. count .. " rows)")
+    -- Final phase: one last cache-only pass after a small delay.
+    local settings = getSettings()
+    local delay = settings.finalEnrichDelaySec or 1
+    if delay < 0 then delay = 0 end
+
+    C_Timer.After(delay, function()
+      local scan = AuctionExportDB.lastScan
+      local scanRows = (scan and scan.rows) or rows
+
+      local stats = finalCacheOnlyEnrichPass(scanRows)
+
+      if scan and scan.rows == scanRows then
+        scan.finalEnrichAtUtc = now()
+        scan.finalEnrichStats = {
+          rowsUpdated = stats.rowsUpdated,
+          remainingRowsMissing = stats.remainingRowsMissing,
+          distinctItemsMissing = stats.distinctItemsMissing,
+          delaySec = delay,
+        }
+      end
+
+      local count = 0
+      if scanRows then count = #scanRows end
+      local suffix = ""
+      if stats.rowsUpdated and stats.rowsUpdated > 0 then
+        suffix = " (final pass updated " .. stats.rowsUpdated .. " rows)"
+      end
+      if stats.remainingRowsMissing and stats.remainingRowsMissing > 0 then
+        suffix = suffix .. " (still missing " .. stats.remainingRowsMissing .. " rows)"
+      end
+      print(ADDON .. ": Export complete (" .. count .. " rows)" .. suffix)
+    end)
   end)
 end
 
