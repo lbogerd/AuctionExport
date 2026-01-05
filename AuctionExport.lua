@@ -21,7 +21,11 @@ local function getSettings()
   if settings.enrichTickSec == nil then settings.enrichTickSec = 1 end
   -- Enrichment runs for up to 30 minutes by default.
   if settings.enrichMaxRuntimeSec == nil then settings.enrichMaxRuntimeSec = 30 * 60 end
-  if settings.itemRequestsPerTick == nil then settings.itemRequestsPerTick = 10 end
+  -- How many distinct item IDs to request per enrich tick (default: 1000/sec).
+  if settings.itemRequestsPerTick == nil then settings.itemRequestsPerTick = 1000 end
+  -- Enrichment has its own scan budget so it can discover enough rows to request.
+  if settings.enrichScanRowsPerTick == nil then settings.enrichScanRowsPerTick = 10000 end
+  if settings.enrichScanBudgetMs == nil then settings.enrichScanBudgetMs = 25 end
   if settings.enrichOverallMaxRequests == nil then settings.enrichOverallMaxRequests = 20000 end
   return settings
 end
@@ -219,11 +223,11 @@ local function tickEnrichJob()
   local t0 = debugprofilestop()
   local settings = getSettings()
   local requestedThisTick = 0
-  local processed = 0
+  local processedLoaded = 0
 
   -- Consume loaded queue and update rows.
   while job.loadedQueueHead <= #job.loadedQueue do
-    if processed >= job.batchSize then break end
+    if processedLoaded >= job.batchSize then break end
     if (debugprofilestop() - t0) >= job.budgetMs then break end
 
     local itemId = job.loadedQueue[job.loadedQueueHead]
@@ -248,13 +252,15 @@ local function tickEnrichJob()
       job.itemToRows[itemId] = nil
     end
 
-    processed = processed + 1
+    processedLoaded = processedLoaded + 1
   end
 
   -- Request item data for rows that need it (rate-limited).
+  local tScan0 = debugprofilestop()
+  local scannedThisTick = 0
   while job.i <= job.total do
-    if processed >= job.batchSize then break end
-    if (debugprofilestop() - t0) >= job.budgetMs then break end
+    if scannedThisTick >= job.scanRowsPerTick then break end
+    if (debugprofilestop() - tScan0) >= job.scanBudgetMs then break end
 
     local r = job.rows[job.i]
     if r and rowMissingAnyInfo(r) then
@@ -271,7 +277,7 @@ local function tickEnrichJob()
 
       if not rowNeedsEnrich(r) then
         job.i = job.i + 1
-        processed = processed + 1
+        scannedThisTick = scannedThisTick + 1
       else
         local itemId = r.itemId
         local list = job.itemToRows[itemId]
@@ -298,11 +304,11 @@ local function tickEnrichJob()
 
         job.rowsNeeding = job.rowsNeeding + 1
         job.i = job.i + 1
-        processed = processed + 1
+        scannedThisTick = scannedThisTick + 1
       end
     else
       job.i = job.i + 1
-      processed = processed + 1
+      scannedThisTick = scannedThisTick + 1
     end
   end
 
@@ -385,8 +391,12 @@ local function startEnrichJob(rows, nextKind, nextFn)
     i = 1,
     total = #rows,
     done = 0,
+    -- Keep loaded-queue processing cheap.
     batchSize = settings.batchSize,
     budgetMs = settings.budgetMs,
+    -- Enrichment scan/request tuning.
+    scanRowsPerTick = settings.enrichScanRowsPerTick,
+    scanBudgetMs = settings.enrichScanBudgetMs,
     lastProgressAt = 0,
 
     itemRequestsPerTick = settings.itemRequestsPerTick,
@@ -412,7 +422,7 @@ local function startEnrichJob(rows, nextKind, nextFn)
     nextFn = nextFn,
   }
 
-  print(ADDON .. ": Enriching item info (" .. activeJob.itemRequestsPerTick .. "/sec, " .. activeJob.overallMaxRequests .. " overall; " .. math.floor(activeJob.maxRuntimeSec/60) .. "m max)")
+  print(ADDON .. ": Enriching item info (" .. activeJob.itemRequestsPerTick .. "/sec, scan " .. activeJob.scanRowsPerTick .. "/sec; " .. activeJob.overallMaxRequests .. " overall; " .. math.floor(activeJob.maxRuntimeSec/60) .. "m max)")
   maybePrintProgress(activeJob, true)
   C_Timer.After(0, tickEnrichJob)
 end

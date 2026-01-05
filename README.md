@@ -16,10 +16,20 @@ The file is stored under `WTF\\Account\\<account>\\SavedVariables\\AuctionExport
 
 If you have a SavedVariables backup like `AuctionExport.lua.bak` (or the normal `AuctionExport.lua`) that contains `AuctionExportDB.lastScan.rows`, you can convert it to a CSV that Excel opens cleanly.
 
+Optional helper: copy your latest SavedVariables into `./data` with a timestamped filename:
+
+- `python .\copy_savedvariables_to_data.py`
+- Add `--include-bak` to also copy `AuctionExport.lua.bak` when present.
+
 1. Run the converter (requires Python 3):
 
    - `python .\auctionexport_to_csv.py "C:\\Path\\To\\AuctionExport.lua.bak"`
    - Output will be written next to the input as `AuctionExport.lua.bak.rows.csv` (UTF-8 with BOM).
+
+   Or, to batch-convert exports under `./data`:
+
+   - `python .\auctionexport_to_csv.py`
+   - The script scans `./data` for `.lua` and `.lua.bak` files and only converts files that don’t already have a matching `*.rows*.csv` next to them.
 
 2. Open the CSV in Excel:
    - Excel → Data → From Text/CSV → select the generated `.csv`.

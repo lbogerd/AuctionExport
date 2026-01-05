@@ -11,9 +11,57 @@ from __future__ import annotations
 
 import argparse
 import csv
+import logging
 import os
 import sys
+import time
 from typing import Any, Dict, List, Optional, Tuple
+
+
+logger = logging.getLogger("auctionexport_to_csv")
+
+
+def _iter_lua_inputs(data_dir: str) -> List[str]:
+    paths: List[str] = []
+    for root, _dirs, files in os.walk(data_dir):
+        for name in files:
+            lower = name.lower()
+            if lower.endswith(".lua") or lower.endswith(".lua.bak"):
+                paths.append(os.path.join(root, name))
+    paths.sort(key=lambda p: p.lower())
+    return paths
+
+
+def _has_matching_csv(input_path: str) -> bool:
+    directory = os.path.dirname(input_path) or "."
+    base = os.path.basename(input_path)
+    prefix = base + ".rows"
+    try:
+        for name in os.listdir(directory):
+            lower = name.lower()
+            if lower.endswith(".csv") and name.startswith(prefix):
+                return True
+    except FileNotFoundError:
+        return False
+    return False
+
+
+def _default_output_csv_path(input_path: str) -> str:
+    return input_path + ".rows.csv"
+
+
+def _log_found_inputs(input_paths: List[str], base_dir: str) -> None:
+    logger.info(f"Found {len(input_paths)} Lua export file(s).")
+
+    # Avoid dumping huge lists at INFO level.
+    max_show = 25
+    shown = input_paths[:max_show]
+    for p in shown:
+        rel = os.path.relpath(p, base_dir)
+        logger.info(f"  - {rel}")
+    remaining = len(input_paths) - len(shown)
+    if remaining > 0:
+        logger.info(f"  ... and {remaining} more")
 
 
 def _skip_lua_string(text: str, i: int) -> int:
@@ -257,7 +305,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     parser.add_argument(
         "input",
-        help="Path to AuctionExport.lua / AuctionExport.lua.bak (SavedVariables export)",
+        nargs="*",
+        help=(
+            "Path(s) to AuctionExport.lua / AuctionExport.lua.bak (SavedVariables export). "
+            "If omitted, scans ./data for .lua and .lua.bak files."
+        ),
     )
     parser.add_argument(
         "-o",
@@ -265,22 +317,86 @@ def main(argv: Optional[List[str]] = None) -> int:
         default=None,
         help="Output CSV path (default: <input>.rows.csv)",
     )
+    parser.add_argument(
+        "--data-dir",
+        default="data",
+        help="Directory to scan when no input paths are provided (default: ./data)",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable more detailed logging",
+    )
 
     args = parser.parse_args(argv)
 
-    input_path = os.path.abspath(args.input)
-    if args.output:
-        output_path = os.path.abspath(args.output)
-    else:
-        output_path = input_path + ".rows.csv"
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s [%(name)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 
-    try:
-        n = convert(input_path, output_path)
-    except Exception as e:
-        print(f"ERROR: {e}", file=sys.stderr)
+    start_total = time.perf_counter()
+
+    input_paths: List[str]
+    if args.input:
+        input_paths = [os.path.abspath(p) for p in args.input]
+    else:
+        data_dir = os.path.abspath(args.data_dir)
+        logger.info(f"Scanning for exports under: {data_dir}")
+        input_paths = [os.path.abspath(p) for p in _iter_lua_inputs(data_dir)]
+
+    base_dir = os.getcwd()
+
+    if input_paths:
+        _log_found_inputs(input_paths, base_dir)
+
+    if not input_paths:
+        logger.info("No .lua / .lua.bak files found.")
+        return 0
+
+    if args.output and len(input_paths) != 1:
+        logger.error("ERROR: --output can only be used with a single input file.")
         return 2
 
-    print(f"Wrote {n} rows to: {output_path}")
+    converted = 0
+    skipped = 0
+    failed = 0
+
+    total = len(input_paths)
+    for idx, input_path in enumerate(input_paths, start=1):
+        if args.output:
+            output_path = os.path.abspath(args.output)
+        else:
+            output_path = _default_output_csv_path(input_path)
+
+        if _has_matching_csv(input_path):
+            skipped += 1
+            logger.info(f"[{idx}/{total}] Skip (CSV exists): {os.path.relpath(input_path, base_dir)}")
+            continue
+
+        try:
+            logger.info(f"[{idx}/{total}] Converting: {os.path.relpath(input_path, base_dir)}")
+            start_file = time.perf_counter()
+            n = convert(input_path, output_path)
+            elapsed = time.perf_counter() - start_file
+            converted += 1
+            logger.info(f"Wrote {n} rows to: {os.path.relpath(output_path, base_dir)}")
+            logger.info(f"[{idx}/{total}] Done in {elapsed:.2f}s")
+        except Exception as e:
+            failed += 1
+            logger.error(f"ERROR converting {input_path}: {e}")
+
+    total_elapsed = time.perf_counter() - start_total
+    logger.info(
+        f"Done. Converted: {converted}, skipped (already had CSV): {skipped}, failed: {failed}."
+    )
+    logger.info(f"Total time: {total_elapsed:.2f}s")
+
+    if failed:
+        return 2
+    if converted == 0:
+        logger.info("Nothing to do.")
     return 0
 
 
