@@ -5,6 +5,9 @@ AuctionExportDB = AuctionExportDB or {}
 local ADDON = "AuctionExport"
 local f = CreateFrame("Frame")
 
+-- This file implements a single-command export pipeline:
+-- replicate scan -> read replicate rows -> enrich missing item info (optional/automatic).
+
 local function getSettings()
   if type(AuctionExportDB) ~= "table" then
     AuctionExportDB = {}
@@ -23,17 +26,26 @@ local function getSettings()
   if settings.enrichMaxRuntimeSec == nil then settings.enrichMaxRuntimeSec = 30 * 60 end
   -- How many distinct item IDs to request per enrich tick (default: 1000/sec).
   if settings.itemRequestsPerTick == nil then settings.itemRequestsPerTick = 1000 end
-  -- Enrichment has its own scan budget so it can discover enough rows to request.
-  if settings.enrichScanRowsPerTick == nil then settings.enrichScanRowsPerTick = 10000 end
-  if settings.enrichScanBudgetMs == nil then settings.enrichScanBudgetMs = 25 end
   if settings.enrichOverallMaxRequests == nil then settings.enrichOverallMaxRequests = 20000 end
+  -- Whether to automatically enrich after a read.
+  if settings.autoEnrich == nil then settings.autoEnrich = true end
   return settings
 end
 
 getSettings() -- ensure defaults exist
 
 local PROGRESS_EVERY_SECONDS = 5
+
+-- Active job state machine.
+-- Kinds:
+--   pipeline: scan(wait)->read->enrich
+--   read: read replicate rows
+--   enrich: enrich missing rows
 local activeJob
+
+local function isActiveJob(kind)
+  return activeJob and activeJob.kind == kind
+end
 
 local scanProgress = {
   inFlight = false,
@@ -41,6 +53,33 @@ local scanProgress = {
   lastPrintAt = 0,
   throttleSeen = false,
 }
+
+local SCAN_READY_POLL_SECONDS = 2
+local function tickScanReadyPoll()
+  -- Some clients/throttle states may not deliver REPLICATE_ITEM_LIST_UPDATE promptly.
+  -- If replicate data is already present, allow the pipeline to continue.
+  if not isActiveJob("pipeline") then return end
+  if not scanProgress.inFlight then return end
+
+  local n = 0
+  if C_AuctionHouse and C_AuctionHouse.GetNumReplicateItems then
+    n = C_AuctionHouse.GetNumReplicateItems() or 0
+  end
+
+  if n and n > 0 then
+    -- We'll let the normal event handler handle this too; but if it never comes,
+    -- this ensures the user isn't stuck.
+    local job = activeJob
+    if job and job.stage == "waiting_scan" then
+      job.scanReadyViaPoll = true
+      -- Simulate readiness; the handler will start reading.
+      f:GetScript("OnEvent")(f, "REPLICATE_ITEM_LIST_UPDATE")
+      return
+    end
+  end
+
+  C_Timer.After(SCAN_READY_POLL_SECONDS, tickScanReadyPoll)
+end
 
 local function isAHMessageSystemThrottled()
   if C_AuctionHouse and C_AuctionHouse.IsThrottledMessageSystemReady then
@@ -85,6 +124,7 @@ local function startScanProgress()
   scanProgress.lastPrintAt = 0
   scanProgress.throttleSeen = isAHMessageSystemThrottled()
   C_Timer.After(PROGRESS_EVERY_SECONDS, tickScanProgress)
+  C_Timer.After(SCAN_READY_POLL_SECONDS, tickScanReadyPoll)
 end
 
 local function now()
@@ -164,30 +204,12 @@ local function enrichRowFromItemId(r)
   return changed
 end
 
-
-local function scanReplicate()
-  if not AuctionHouseFrame or not AuctionHouseFrame:IsShown() then
-    print(ADDON .. ": Open the Auction House first.")
-    return
-  end
-
-  if isAHMessageSystemThrottled() then
-    print(ADDON .. ": Auction House is currently throttling requests. Replicate scan may be delayed or ignored; try again later.")
-  end
-
-  print(ADDON .. ": Requesting replicate scan... (may be throttled)")
-  -- Throttled ~15 minutes account-wide when successful.
-  C_AuctionHouse.ReplicateItems()
-
-  -- Print periodic status while we wait for REPLICATE_ITEM_LIST_UPDATE.
-  startScanProgress()
-end
-
 local function cancelActiveJob(reason)
   if not activeJob then return end
 
   local kind = activeJob.kind
   activeJob = nil
+  stopScanProgress()
   if reason then
     print(ADDON .. ": Canceled " .. kind .. " job (" .. reason .. ")")
   else
@@ -210,15 +232,72 @@ local function maybePrintProgress(job, force)
     pct = math.floor((done / total) * 100)
   end
 
-  local label = job.kind == "read" and "Reading"
-    or (job.kind == "enrich" and "Loading item data")
-    or "Working"
+  if job.kind == "enrich" then
+    local queued = 0
+    if job.loadedQueue and job.loadedQueueHead then
+      queued = #job.loadedQueue - job.loadedQueueHead + 1
+      if queued < 0 then queued = 0 end
+    end
+    local runtimeSec = 0
+    if job.startedAt then
+      runtimeSec = math.floor(GetTime() - job.startedAt)
+    end
+
+    local pending = job.pendingCount or 0
+    local overallRequested = job.overallRequested or 0
+    local overallMax = job.overallMaxRequests or 0
+    local rowsUpdated = job.rowsUpdated or 0
+    local itemsTotal = job.total or 0
+
+    local msg = ": Enriching item info... items " .. done .. "/" .. itemsTotal .. " (" .. pct .. "%)"
+      .. "; pending " .. pending
+      .. "; loadQ " .. queued
+      .. "; requested " .. overallRequested .. "/" .. overallMax
+      .. "; updatedRows " .. rowsUpdated
+      .. "; runtime " .. runtimeSec .. "s/" .. math.floor((job.maxRuntimeSec or 0)) .. "s"
+    print(ADDON .. msg)
+    return
+  end
+
+  if job.kind == "pipeline" then
+    local stage = job.stage or "?"
+    local runtimeSec = 0
+    if job.startedAt then
+      runtimeSec = math.floor(GetTime() - job.startedAt)
+    end
+    print(ADDON .. ": Export pipeline [" .. stage .. "] runtime " .. runtimeSec .. "s")
+    return
+  end
+
+  local label = job.kind == "read" and "Reading" or "Working"
   print(ADDON .. ": " .. label .. "... " .. done .. "/" .. total .. " (" .. pct .. "%)")
 end
 
 local function tickEnrichJob()
   local job = activeJob
   if not job or job.kind ~= "enrich" then return end
+
+  local runtime = GetTime() - job.startedAt
+  if runtime >= job.maxRuntimeSec then
+    local scan = AuctionExportDB.lastScan
+    if scan and scan.rows == job.rows then
+      scan.enrichedAtUtc = now()
+      scan.enrichStats = {
+        rowsUpdated = job.rowsUpdated,
+        overallItemRequests = job.overallRequested,
+        runtimeSec = math.floor(runtime),
+        timedOut = true,
+        missingRowsNoItemId = job.missingRowsNoItemId,
+        remainingDistinctItems = job.pendingCount + ((job.total or 0) - (job.done or 0)),
+      }
+    end
+
+    local onDone = job.onDone
+    activeJob = nil
+    print(ADDON .. ": Item data enrichment stopped (hit max runtime; updated " .. job.rowsUpdated .. " rows; requested " .. job.overallRequested .. " items)")
+    if onDone then onDone(false) end
+    return
+  end
 
   local t0 = debugprofilestop()
   local settings = getSettings()
@@ -233,6 +312,7 @@ local function tickEnrichJob()
     local itemId = job.loadedQueue[job.loadedQueueHead]
     job.loadedQueueHead = job.loadedQueueHead + 1
 
+    -- Stop tracking pending first to avoid re-queuing.
     if job.pending[itemId] then
       job.pending[itemId] = nil
       job.pendingCount = job.pendingCount - 1
@@ -249,47 +329,66 @@ local function tickEnrichJob()
           end
         end
       end
-      job.itemToRows[itemId] = nil
+      -- Keep mapping; a later load event might arrive even if the first was not enough.
+      -- But if rows no longer need enrichment, we can drop it.
+      local stillNeeded = false
+      for j = 1, #indices do
+        local idx = indices[j]
+        local r = job.rows[idx]
+        if r and rowNeedsEnrich(r) then
+          stillNeeded = true
+          break
+        end
+      end
+      if not stillNeeded then
+        job.itemToRows[itemId] = nil
+      end
     end
 
     processedLoaded = processedLoaded + 1
   end
 
-  -- Request item data for rows that need it (rate-limited).
-  local tScan0 = debugprofilestop()
-  local scannedThisTick = 0
-  while job.i <= job.total do
-    if scannedThisTick >= job.scanRowsPerTick then break end
-    if (debugprofilestop() - tScan0) >= job.scanBudgetMs then break end
+  -- Request item data for distinct itemIds (rate-limited).
+  while job.queueHead <= #job.queue do
+    if requestedThisTick >= job.itemRequestsPerTick then break end
+    if job.overallRequested >= job.overallMaxRequests then break end
+    if (debugprofilestop() - t0) >= job.budgetMs then break end
 
-    local r = job.rows[job.i]
-    if r and rowMissingAnyInfo(r) then
-      if not r.itemId or r.itemId <= 0 then
-        job.missingNoItemIdThisPass = job.missingNoItemIdThisPass + 1
-      end
-    end
+    local itemId = job.queue[job.queueHead]
+    job.queueHead = job.queueHead + 1
+    job.done = job.queueHead - 1
 
-    if r and rowNeedsEnrich(r) then
-      -- If the item is already cached locally, fill what we can without requesting.
-      if enrichRowFromItemId(r) then
-        job.rowsUpdated = job.rowsUpdated + 1
-      end
-
-      if not rowNeedsEnrich(r) then
-        job.i = job.i + 1
-        scannedThisTick = scannedThisTick + 1
-      else
-        local itemId = r.itemId
-        local list = job.itemToRows[itemId]
-        if not list then
-          list = {}
-          job.itemToRows[itemId] = list
+    -- If everything for this itemId is already filled, skip requesting.
+    local indices = job.itemToRows[itemId]
+    if indices then
+      -- Try local cache first (cheap).
+      local anyChanged = false
+      for j = 1, #indices do
+        local idx = indices[j]
+        local r = job.rows[idx]
+        if r and rowNeedsEnrich(r) then
+          if enrichRowFromItemId(r) then
+            anyChanged = true
+            job.rowsUpdated = job.rowsUpdated + 1
+          end
         end
-        list[#list + 1] = job.i
+      end
 
+      -- If still missing, request load.
+      local stillMissing = false
+      for j = 1, #indices do
+        local idx = indices[j]
+        local r = job.rows[idx]
+        if r and rowNeedsEnrich(r) then
+          stillMissing = true
+          break
+        end
+      end
+
+      if not stillMissing then
+        job.itemToRows[itemId] = nil
+      else
         if not job.requestedEver[itemId]
-          and requestedThisTick < job.itemRequestsPerTick
-          and job.overallRequested < job.overallMaxRequests
           and C_Item
           and C_Item.RequestLoadItemDataByID
         then
@@ -299,84 +398,76 @@ local function tickEnrichJob()
           job.overallRequested = job.overallRequested + 1
           requestedThisTick = requestedThisTick + 1
           C_Item.RequestLoadItemDataByID(itemId)
-          job.requestedThisPass = job.requestedThisPass + 1
         end
-
-        job.rowsNeeding = job.rowsNeeding + 1
-        job.i = job.i + 1
-        scannedThisTick = scannedThisTick + 1
       end
-    else
-      job.i = job.i + 1
-      scannedThisTick = scannedThisTick + 1
     end
   end
 
-  job.done = job.i - 1
   maybePrintProgress(job, false)
 
-  local runtime = GetTime() - job.startedAt
-  local timedOut = runtime >= job.maxRuntimeSec
-  local fullyScanned = job.i > job.total
+  local allQueuedProcessed = job.queueHead > #job.queue
+  local nothingPending = job.pendingCount <= 0
 
-  if fullyScanned then
-    -- One full pass completed.
-    if job.pendingCount <= 0 and job.requestedThisPass == 0 then
-      -- Nothing in-flight and we didn't request anything new in a full pass.
-      local scan = AuctionExportDB.lastScan
-      if scan and scan.rows == job.rows then
-        scan.enrichedAtUtc = now()
-        scan.enrichStats = {
-          rowsUpdated = job.rowsUpdated,
-          overallItemRequests = job.overallRequested,
-          runtimeSec = math.floor(runtime),
-          missingNoItemIdThisPass = job.missingNoItemIdThisPass,
-        }
+  if allQueuedProcessed and nothingPending then
+    -- One final best-effort pass for any items that got cached without events.
+    local remaining = 0
+    for itemId, indices in pairs(job.itemToRows) do
+      local stillMissing = false
+      for j = 1, #indices do
+        local idx = indices[j]
+        local r = job.rows[idx]
+        if r and rowNeedsEnrich(r) then
+          if enrichRowFromItemId(r) then
+            job.rowsUpdated = job.rowsUpdated + 1
+          end
+        end
       end
-
-      activeJob = nil
-      local msg = ": Item data enrichment complete (updated " .. job.rowsUpdated .. " rows; requested " .. job.overallRequested .. " items"
-      if job.overallRequested >= job.overallMaxRequests then msg = msg .. "; hit overall request cap" end
-      if job.missingNoItemIdThisPass > 0 then msg = msg .. "; missing itemId rows seen" end
-      msg = msg .. ")"
-      print(ADDON .. msg)
-      return
+      for j = 1, #indices do
+        local idx = indices[j]
+        local r = job.rows[idx]
+        if r and rowNeedsEnrich(r) then
+          stillMissing = true
+          break
+        end
+      end
+      if stillMissing then
+        remaining = remaining + 1
+      end
     end
 
-    if timedOut then
-      local scan = AuctionExportDB.lastScan
-      if scan and scan.rows == job.rows then
-        scan.enrichedAtUtc = now()
-        scan.enrichStats = {
-          rowsUpdated = job.rowsUpdated,
-          overallItemRequests = job.overallRequested,
-          runtimeSec = math.floor(runtime),
-          timedOut = true,
-          missingNoItemIdThisPass = job.missingNoItemIdThisPass,
-        }
-      end
-
-      activeJob = nil
-      print(ADDON .. ": Item data enrichment stopped (hit max runtime; updated " .. job.rowsUpdated .. " rows; requested " .. job.overallRequested .. " items)")
-      return
+    local scan = AuctionExportDB.lastScan
+    if scan and scan.rows == job.rows then
+      scan.enrichedAtUtc = now()
+      scan.enrichStats = {
+        rowsUpdated = job.rowsUpdated,
+        overallItemRequests = job.overallRequested,
+        runtimeSec = math.floor(runtime),
+        missingRowsNoItemId = job.missingRowsNoItemId,
+        remainingDistinctItems = remaining,
+        hitOverallRequestCap = (job.overallRequested >= job.overallMaxRequests) or nil,
+      }
     end
 
-    -- Reset pass counters and wrap.
-    job.i = 1
-    job.requestedThisPass = 0
-    job.missingNoItemIdThisPass = 0
-    job.itemToRows = {}
+    local onDone = job.onDone
+    activeJob = nil
+    local msg = ": Item data enrichment complete (updated " .. job.rowsUpdated .. " rows; requested " .. job.overallRequested .. " items"
+    if job.overallRequested >= job.overallMaxRequests then msg = msg .. "; hit overall request cap" end
+    if job.missingRowsNoItemId and job.missingRowsNoItemId > 0 then msg = msg .. "; rows missing itemId seen" end
+    if remaining > 0 then msg = msg .. "; still-missing items " .. remaining end
+    msg = msg .. ")"
+    print(ADDON .. msg)
+    if onDone then onDone(true) end
+    return
   end
 
-  -- Keep trying once per second.
   local tickSec = settings.enrichTickSec or 1
   if tickSec < 0.1 then tickSec = 0.1 end
   C_Timer.After(tickSec, tickEnrichJob)
 end
 
-local function startEnrichJob(rows, nextKind, nextFn)
+local function startEnrichJob(rows, onDone)
   if not rows or #rows == 0 then
-    if nextFn then nextFn() end
+    if onDone then onDone(true) end
     return
   end
 
@@ -385,20 +476,73 @@ local function startEnrichJob(rows, nextKind, nextFn)
   end
 
   local settings = getSettings()
+
+  -- Precompute distinct itemIds needing enrichment and map itemId -> row indices.
+  local itemToRows = {}
+  local queue = {}
+  local queued = {}
+  local missingRowsNoItemId = 0
+
+  for i = 1, #rows do
+    local r = rows[i]
+    if r and rowMissingAnyInfo(r) then
+      if not r.itemId or r.itemId <= 0 then
+        missingRowsNoItemId = missingRowsNoItemId + 1
+      end
+    end
+    if r and rowNeedsEnrich(r) then
+      -- Try cache first so we don't request if already available.
+      if enrichRowFromItemId(r) then
+        -- We'll count updated rows during job tick processing too, but this is a cheap early win.
+      end
+      if rowNeedsEnrich(r) and r.itemId and r.itemId > 0 then
+        local list = itemToRows[r.itemId]
+        if not list then
+          list = {}
+          itemToRows[r.itemId] = list
+        end
+        list[#list + 1] = i
+        if not queued[r.itemId] then
+          queued[r.itemId] = true
+          queue[#queue + 1] = r.itemId
+        end
+      end
+    end
+  end
+
+  if #queue == 0 then
+    -- Nothing enrichable (either everything already filled or missing itemIds).
+    local scan = AuctionExportDB.lastScan
+    if scan and scan.rows == rows then
+      scan.enrichedAtUtc = now()
+      scan.enrichStats = {
+        rowsUpdated = 0,
+        overallItemRequests = 0,
+        runtimeSec = 0,
+        missingRowsNoItemId = missingRowsNoItemId,
+        remainingDistinctItems = 0,
+      }
+    end
+    print(ADDON .. ": No enrichable rows (missing itemId rows: " .. missingRowsNoItemId .. ")")
+    if onDone then onDone(true) end
+    return
+  end
+
   activeJob = {
     kind = "enrich",
     rows = rows,
-    i = 1,
-    total = #rows,
+    queue = queue,
+    queueHead = 1,
+    total = #queue,
     done = 0,
-    -- Keep loaded-queue processing cheap.
+    lastProgressAt = 0,
+    startedAt = GetTime(),
+
+    -- Keep processing cheap.
     batchSize = settings.batchSize,
     budgetMs = settings.budgetMs,
-    -- Enrichment scan/request tuning.
-    scanRowsPerTick = settings.enrichScanRowsPerTick,
-    scanBudgetMs = settings.enrichScanBudgetMs,
-    lastProgressAt = 0,
 
+    -- Request tuning.
     itemRequestsPerTick = settings.itemRequestsPerTick,
     overallRequested = 0,
     overallMaxRequests = settings.enrichOverallMaxRequests,
@@ -409,20 +553,15 @@ local function startEnrichJob(rows, nextKind, nextFn)
     pendingCount = 0,
     loadedQueue = {},
     loadedQueueHead = 1,
-    itemToRows = {},
+    itemToRows = itemToRows,
 
-    startedAt = GetTime(),
-    rowsNeeding = 0,
     rowsUpdated = 0,
+    missingRowsNoItemId = missingRowsNoItemId,
 
-    requestedThisPass = 0,
-    missingNoItemIdThisPass = 0,
-
-    nextKind = nextKind,
-    nextFn = nextFn,
+    onDone = onDone,
   }
 
-  print(ADDON .. ": Enriching item info (" .. activeJob.itemRequestsPerTick .. "/sec, scan " .. activeJob.scanRowsPerTick .. "/sec; " .. activeJob.overallMaxRequests .. " overall; " .. math.floor(activeJob.maxRuntimeSec/60) .. "m max)")
+  print(ADDON .. ": Enriching item info (distinct items " .. activeJob.total .. "; " .. activeJob.itemRequestsPerTick .. "/sec; " .. activeJob.overallMaxRequests .. " overall; " .. math.floor(activeJob.maxRuntimeSec/60) .. "m max)")
   maybePrintProgress(activeJob, true)
   C_Timer.After(0, tickEnrichJob)
 end
@@ -434,7 +573,7 @@ local function tickReadJob()
   local t0 = debugprofilestop()
   local processed = 0
 
-  while job.i < job.total do
+  while job.i <= job.total do
     if processed >= job.batchSize then break end
     if (debugprofilestop() - t0) >= job.budgetMs then break end
 
@@ -470,25 +609,28 @@ local function tickReadJob()
     processed = processed + 1
   end
 
-  job.done = job.i
+  job.done = job.i - 1
   maybePrintProgress(job, false)
 
-  if job.i >= job.total then
+  if job.i > job.total then
     AuctionExportDB.lastScan = {
       scannedAtUtc = job.scannedAtUtc,
       numItems = #job.rows,
       rows = job.rows,
     }
+
+    local onDone = job.onDone
     activeJob = nil
     maybePrintProgress({ kind = "read", done = job.total, total = job.total, lastProgressAt = 0 }, true)
-    print(ADDON .. ": Stored " .. #job.rows .. " rows in SavedVariables. Use /ahexport enrich (optional)")
+    print(ADDON .. ": Stored " .. #job.rows .. " rows in SavedVariables")
+    if onDone then onDone(job.rows) end
     return
   end
 
   C_Timer.After(0, tickReadJob)
 end
 
-local function startReadJob()
+local function startReadJob(onDone)
   local n = C_AuctionHouse.GetNumReplicateItems()
   if not n or n == 0 then
     print(ADDON .. ": No replicate items available yet.")
@@ -502,7 +644,7 @@ local function startReadJob()
   local settings = getSettings()
   activeJob = {
     kind = "read",
-    i = 0,
+    i = 1,
     total = n,
     done = 0,
     scannedAtUtc = now(),
@@ -510,6 +652,7 @@ local function startReadJob()
     batchSize = settings.batchSize,
     budgetMs = settings.budgetMs,
     lastProgressAt = 0,
+    onDone = onDone,
   }
 
   print(ADDON .. ": Starting read job (" .. activeJob.total .. " items)")
@@ -517,8 +660,100 @@ local function startReadJob()
   C_Timer.After(0, tickReadJob)
 end
 
-local function readReplicateToDB()
-  startReadJob()
+local function scanReplicate()
+  if not AuctionHouseFrame or not AuctionHouseFrame:IsShown() then
+    print(ADDON .. ": Open the Auction House first.")
+    return false
+  end
+
+  if isAHMessageSystemThrottled() then
+    print(ADDON .. ": Auction House is currently throttling requests. Replicate scan may be delayed or ignored; continuing anyway.")
+  end
+
+  print(ADDON .. ": Requesting replicate scan... (may be throttled)")
+  -- Throttled ~15 minutes account-wide when successful.
+  C_AuctionHouse.ReplicateItems()
+
+  -- Print periodic status while we wait for REPLICATE_ITEM_LIST_UPDATE.
+  startScanProgress()
+  return true
+end
+
+local function readReplicateToDB(onDone)
+  startReadJob(onDone)
+end
+
+local function startPipeline()
+  if activeJob then
+    cancelActiveJob("starting export")
+  end
+
+  local job = {
+    kind = "pipeline",
+    stage = "scan",
+    startedAt = GetTime(),
+    scannedAtUtc = now(),
+  }
+  activeJob = job
+
+  if not scanReplicate() then
+    activeJob = nil
+    return
+  end
+
+  job.stage = "waiting_scan"
+  maybePrintProgress(job, true)
+end
+
+local function continuePipelineAfterRead(rows)
+  local job = activeJob
+  if not job or job.kind ~= "pipeline" then
+    return
+  end
+
+  local settings = getSettings()
+  if not settings.autoEnrich then
+    job.stage = "done"
+    activeJob = nil
+    print(ADDON .. ": Export complete (read " .. (#rows or 0) .. " rows; autoEnrich disabled)")
+    return
+  end
+
+  job.stage = "enrich"
+  maybePrintProgress(job, true)
+
+  startEnrichJob(rows, function(_ok)
+    local pj = activeJob
+    -- If enrich created its own job, pipeline job was replaced.
+    -- We'll just finalize from SavedVariables.
+    local scan = AuctionExportDB.lastScan
+    local count = 0
+    if scan and scan.rows then count = #scan.rows end
+    print(ADDON .. ": Export complete (" .. count .. " rows)")
+  end)
+end
+
+local function continuePipelineAfterScanReady()
+  local job = activeJob
+  if not job or job.kind ~= "pipeline" then
+    return
+  end
+  job.stage = "read"
+  maybePrintProgress(job, true)
+
+  -- Temporarily replace pipeline job with read job; pipeline continues via callback.
+  readReplicateToDB(function(rows)
+    -- Recreate pipeline job to keep stage/progress cohesive.
+    local pj = {
+      kind = "pipeline",
+      stage = "post_read",
+      startedAt = job.startedAt,
+      scannedAtUtc = job.scannedAtUtc,
+      scanReadyViaPoll = job.scanReadyViaPoll,
+    }
+    activeJob = pj
+    continuePipelineAfterRead(rows)
+  end)
 end
 
 SLASH_AUCTIONEXPORT1 = "/ahexport"
@@ -528,7 +763,9 @@ SlashCmdList["AUCTIONEXPORT"] = function(msg)
   cmd = cmd or ""
   rest = rest or ""
 
-  if cmd == "scan" then
+  if cmd == "" or cmd == "run" or cmd == "export" then
+    startPipeline()
+  elseif cmd == "scan" then
     if rest == "cancel" or rest == "stop" then
       if scanProgress.inFlight then
         stopScanProgress()
@@ -547,7 +784,7 @@ SlashCmdList["AUCTIONEXPORT"] = function(msg)
       print(ADDON .. ": No scan in progress.")
     end
   elseif cmd == "read" then
-    readReplicateToDB()
+    readReplicateToDB(nil)
   elseif cmd == "enrich" then
     local scan = AuctionExportDB.lastScan
     if not scan or not scan.rows then
@@ -558,8 +795,14 @@ SlashCmdList["AUCTIONEXPORT"] = function(msg)
       print(ADDON .. ": Item data loading API not available on this client.")
       return
     end
-
-    startEnrichJob(scan.rows, nil, nil)
+    startEnrichJob(scan.rows, nil)
+  elseif cmd == "cancel" or cmd == "stop" then
+    if activeJob or scanProgress.inFlight then
+      cancelActiveJob("user")
+      print(ADDON .. ": Canceled.")
+    else
+      print(ADDON .. ": Nothing to cancel.")
+    end
   elseif cmd == "clear" then
     if activeJob then
       cancelActiveJob("clear")
@@ -568,40 +811,51 @@ SlashCmdList["AUCTIONEXPORT"] = function(msg)
     print(ADDON .. ": Cleared.")
   else
     print(ADDON .. " commands:")
-    print("  /ahexport scan         - request replicate scan (AH must be open; may be throttled)")
+    print("  /ahexport              - scan + read + enrich missing item info")
+    print("  /ahexport run          - same as /ahexport")
+    print("  /ahexport scan         - request replicate scan only (AH must be open; may be throttled)")
     print("  /ahexport scan cancel  - cancel scan wait/progress timer")
-    print("  /ahexport stopscan     - cancel scan wait/progress timer")
-    print("  /ahexport read   - read replicate rows into SavedVariables")
-    print("  /ahexport enrich       - try to fill missing item names/links locally (rate-limited)")
-    print("  /ahexport clear  - clear stored data")
+    print("  /ahexport read         - read replicate rows into SavedVariables")
+    print("  /ahexport enrich       - enrich missing item names/links/quality (rate-limited)")
+    print("  /ahexport cancel       - cancel any active job")
+    print("  /ahexport clear        - clear stored data")
   end
 end
 
 -- Event wiring: replicate list update fires when the scan result is ready.
 f:RegisterEvent("REPLICATE_ITEM_LIST_UPDATE")
 f:RegisterEvent("ITEM_DATA_LOAD_RESULT")
+f:RegisterEvent("GET_ITEM_INFO_RECEIVED")
 f:SetScript("OnEvent", function(_, event, ...)
   if event == "REPLICATE_ITEM_LIST_UPDATE" then
-    -- This event can fire for reasons other than our /ahexport scan.
-    -- Only announce readiness when we are actively waiting for a scan result.
-    if not scanProgress.inFlight then
+    -- This event can fire for reasons other than our scan request.
+    -- Only act if we're waiting for a scan result (scanProgress) or pipeline is waiting.
+    if not scanProgress.inFlight and not (isActiveJob("pipeline") and activeJob.stage == "waiting_scan") then
       return
     end
 
     local elapsedMsg = ""
-    if scanProgress.inFlight and scanProgress.requestedAt and scanProgress.requestedAt > 0 then
+    if scanProgress.requestedAt and scanProgress.requestedAt > 0 then
       local elapsed = math.floor(GetTime() - scanProgress.requestedAt)
       elapsedMsg = " after " .. elapsed .. "s"
     end
 
     local throttleMsg = ""
-    if scanProgress.inFlight and scanProgress.throttleSeen then
+    if scanProgress.throttleSeen then
       throttleMsg = " (throttling was active)"
     end
 
     stopScanProgress()
-    print(ADDON .. ": Replicate list ready" .. elapsedMsg .. ". Now run /ahexport read" .. throttleMsg)
-  elseif event == "ITEM_DATA_LOAD_RESULT" then
+
+    if isActiveJob("pipeline") and activeJob.stage == "waiting_scan" then
+      local via = activeJob.scanReadyViaPoll and " (detected via poll)" or ""
+      print(ADDON .. ": Replicate list ready" .. elapsedMsg .. via .. throttleMsg .. ". Reading...")
+      continuePipelineAfterScanReady()
+      return
+    end
+
+    print(ADDON .. ": Replicate list ready" .. elapsedMsg .. throttleMsg)
+  elseif event == "ITEM_DATA_LOAD_RESULT" or event == "GET_ITEM_INFO_RECEIVED" then
     local job = activeJob
     if not job or job.kind ~= "enrich" then
       return
@@ -623,4 +877,4 @@ f:SetScript("OnEvent", function(_, event, ...)
   end
 end)
 
-print(ADDON .. " loaded. Open AH and run /ahexport scan")
+print(ADDON .. " loaded. Open AH and run /ahexport")

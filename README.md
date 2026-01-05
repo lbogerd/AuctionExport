@@ -5,9 +5,13 @@ Small WoW addon to export Auction House replicate data to SavedVariables.
 ## Usage
 
 1. Open the Auction House.
-2. Run `/ahexport scan` to request a replicate scan (Blizzard throttles this).
-3. When you see the "Replicate list ready" message, run `/ahexport read`.
-4. Optionally run `/ahexport enrich` to try to fill missing item names/links/quality (rate-limited).
+2. Run `/ahexport` to run the full pipeline (scan → read → enrich missing item info).
+
+Manual (debug/troubleshooting) flow:
+
+1. Run `/ahexport scan` to request a replicate scan (Blizzard throttles this).
+2. When you see the "Replicate list ready" message, run `/ahexport read`.
+3. Optionally run `/ahexport enrich` to try to fill missing item names/links/quality (rate-limited).
 
 Note: WoW only writes SavedVariables to disk on `/reload`, logout, or exit.
 The file is stored under `WTF\\Account\\<account>\\SavedVariables\\AuctionExport.lua` (not directly under the account folder).
@@ -43,11 +47,14 @@ Run copy + convert in one command:
 
 ### Commands
 
+- `/ahexport` — Scan + read + enrich missing item info (single command).
+- `/ahexport run` — Same as `/ahexport`.
 - `/ahexport scan` — Request replicate scan (AH must be open; may be throttled).
 - `/ahexport scan cancel` — Cancel scan wait/progress timer.
 - `/ahexport stopscan` — Cancel scan wait/progress timer.
 - `/ahexport read` — Read replicate rows into SavedVariables.
 - `/ahexport enrich` — Try to fill missing item names/links/quality from local item cache (rate-limited; may take a few seconds).
+- `/ahexport cancel` — Cancel any active job.
 - `/ahexport clear` — Clear stored scan data.
 
 ## Batching (responsiveness)
