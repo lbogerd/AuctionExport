@@ -38,6 +38,11 @@ getSettings() -- ensure defaults exist
 
 local PROGRESS_EVERY_SECONDS = 5
 
+-- Replicate scan throttle window (Blizzard-side). We can't know for sure whether a request will be accepted,
+-- but we can warn when the last successful scan was recent.
+local REPLICATE_THROTTLE_WINDOW_SEC = 15 * 60
+local RECENT_SCAN_POPUP_KEY = "AUCTIONEXPORT_RECENT_SCAN_CONFIRM"
+
 -- Active job state machine.
 -- Kinds:
 --   pipeline: scan(wait)->read->enrich
@@ -131,6 +136,123 @@ end
 
 local function now()
   return date("!%Y-%m-%dT%H:%M:%SZ") -- UTC ISO-ish
+end
+
+local function getLastSuccessfulReplicateAt()
+  local t = AuctionExportDB and AuctionExportDB.lastSuccessfulReplicateAt
+  if type(t) ~= "number" then return 0 end
+  return t
+end
+
+local function secondsUntilReplicateWindowExpires()
+  local last = getLastSuccessfulReplicateAt()
+  if not last or last <= 0 then return 0 end
+  local elapsed = time() - last
+  local remaining = REPLICATE_THROTTLE_WINDOW_SEC - elapsed
+  if remaining > 0 then return remaining end
+  return 0
+end
+
+local function formatRemainingMmSs(sec)
+  if not sec or sec <= 0 then return "0:00" end
+  local m = math.floor(sec / 60)
+  local s = math.floor(sec % 60)
+  return string.format("%d:%02d", m, s)
+end
+
+local function ensureRecentScanPopupDefined()
+  if StaticPopupDialogs and StaticPopupDialogs[RECENT_SCAN_POPUP_KEY] then
+    return
+  end
+  if not StaticPopupDialogs then
+    return
+  end
+
+  StaticPopupDialogs[RECENT_SCAN_POPUP_KEY] = {
+    text = ADDON .. ": Last successful scan was recent. Blizzard throttles replicate scans (~15 minutes).\n\nStill try anyway?",
+    button1 = "Still try",
+    button2 = "Ok I'll wait",
+    timeout = 0,
+    whileDead = true,
+    hideOnEscape = true,
+    preferredIndex = 3,
+    OnShow = function(self)
+      -- Live countdown: update the popup text every second while it is visible.
+      local function setText()
+        local remaining = secondsUntilReplicateWindowExpires()
+        local msg
+        if remaining > 0 then
+          msg = ADDON .. ": Last successful scan was recent. Blizzard throttles replicate scans (~15 minutes).\n"
+            .. "Wait time remaining: " .. formatRemainingMmSs(remaining) .. "\n\nStill try anyway?"
+        else
+          msg = ADDON .. ": Last successful scan is older than ~15 minutes.\n\nTry a scan now?"
+        end
+
+        local textRegion = self.text
+        if not textRegion and self.GetName then
+          local name = self:GetName()
+          if name and _G[name .. "Text"] then
+            textRegion = _G[name .. "Text"]
+          end
+        end
+        if textRegion and textRegion.SetText then
+          textRegion:SetText(msg)
+        end
+      end
+
+      setText()
+      if self._auctionExportTicker and self._auctionExportTicker.Cancel then
+        self._auctionExportTicker:Cancel()
+      end
+      if C_Timer and C_Timer.NewTicker then
+        self._auctionExportTicker = C_Timer.NewTicker(1, function()
+          if self and self.IsShown and self:IsShown() then
+            setText()
+          end
+        end)
+      end
+    end,
+    OnHide = function(self)
+      if self._auctionExportTicker and self._auctionExportTicker.Cancel then
+        self._auctionExportTicker:Cancel()
+      end
+      self._auctionExportTicker = nil
+    end,
+    OnAccept = function(_self, data)
+      if data and type(data.onProceed) == "function" then
+        data.onProceed(true)
+      end
+    end,
+    OnCancel = function(_self, data)
+      if data and type(data.onProceed) == "function" then
+        data.onProceed(false)
+      end
+    end,
+  }
+end
+
+local function confirmRecentScanAndMaybeProceed(onProceed)
+  if type(onProceed) ~= "function" then return end
+  local remaining = secondsUntilReplicateWindowExpires()
+  if remaining > 0 then
+    ensureRecentScanPopupDefined()
+    if StaticPopup_Show then
+      StaticPopup_Show(RECENT_SCAN_POPUP_KEY, nil, nil, { onProceed = function(accepted)
+        if accepted then
+          onProceed()
+        end
+      end })
+      return
+    end
+  end
+  onProceed()
+end
+
+local function getAHParentFrame()
+  -- Retail uses AuctionHouseFrame; Classic-era UI uses AuctionFrame.
+  if AuctionHouseFrame then return AuctionHouseFrame end
+  if AuctionFrame then return AuctionFrame end
+  return nil
 end
 
 local function itemIdFromLink(itemLink)
@@ -744,7 +866,7 @@ local function readReplicateToDB(onDone)
   startReadJob(onDone)
 end
 
-local function startPipeline()
+local function startPipelineInternal()
   if activeJob then
     cancelActiveJob("starting export")
   end
@@ -764,6 +886,68 @@ local function startPipeline()
 
   job.stage = "waiting_scan"
   maybePrintProgress(job, true)
+end
+
+local function startPipeline()
+  confirmRecentScanAndMaybeProceed(startPipelineInternal)
+end
+
+local function startScanOnly()
+  confirmRecentScanAndMaybeProceed(function()
+    scanReplicate()
+  end)
+end
+
+local function stopAll(reason)
+  local did = false
+  if scanProgress.inFlight then
+    stopScanProgress()
+    did = true
+  end
+  if activeJob then
+    cancelActiveJob(reason or "user")
+    did = true
+  end
+  return did
+end
+
+local function ensureAHButtons()
+  local parent = getAHParentFrame()
+  if not parent then return end
+  if parent._auctionExportButtonsCreated then return end
+  parent._auctionExportButtonsCreated = true
+
+  -- Use a tiny anchor frame so we can reliably position and layer the buttons.
+  local holder = CreateFrame("Frame", nil, parent)
+  holder:SetSize(1, 1)
+  holder:SetPoint("BOTTOM", parent, "BOTTOM", 0, 60)
+  holder:SetFrameStrata("HIGH")
+  holder:SetFrameLevel((parent:GetFrameLevel() or 0) + 50)
+
+  local stopBtn = CreateFrame("Button", nil, holder, "UIPanelButtonTemplate")
+  stopBtn:SetSize(70, 22)
+  stopBtn:SetText("Stop")
+  stopBtn:SetPoint("CENTER", holder, "CENTER", 40, 0)
+  stopBtn:SetScript("OnClick", function()
+    if stopAll("user") then
+      print(ADDON .. ": Canceled.")
+    else
+      print(ADDON .. ": Nothing to cancel.")
+    end
+  end)
+
+  local startBtn = CreateFrame("Button", nil, holder, "UIPanelButtonTemplate")
+  startBtn:SetSize(70, 22)
+  startBtn:SetText("Start")
+  startBtn:SetPoint("RIGHT", stopBtn, "LEFT", -6, 0)
+  startBtn:SetScript("OnClick", function()
+    startPipeline()
+  end)
+
+  -- Keep references for debugging/adjustments.
+  parent._auctionExportStartBtn = startBtn
+  parent._auctionExportStopBtn = stopBtn
+  parent._auctionExportHolder = holder
 end
 
 local function continuePipelineAfterRead(rows)
@@ -861,7 +1045,7 @@ SlashCmdList["AUCTIONEXPORT"] = function(msg)
       end
       return
     end
-    scanReplicate()
+    startScanOnly()
   elseif cmd == "stopscan" then
     if scanProgress.inFlight then
       stopScanProgress()
@@ -883,8 +1067,7 @@ SlashCmdList["AUCTIONEXPORT"] = function(msg)
     end
     startEnrichJob(scan.rows, nil)
   elseif cmd == "cancel" or cmd == "stop" then
-    if activeJob or scanProgress.inFlight then
-      cancelActiveJob("user")
+    if stopAll("user") then
       print(ADDON .. ": Canceled.")
     else
       print(ADDON .. ": Nothing to cancel.")
@@ -912,7 +1095,23 @@ end
 f:RegisterEvent("REPLICATE_ITEM_LIST_UPDATE")
 f:RegisterEvent("ITEM_DATA_LOAD_RESULT")
 f:RegisterEvent("GET_ITEM_INFO_RECEIVED")
+f:RegisterEvent("AUCTION_HOUSE_SHOW")
+f:RegisterEvent("PLAYER_LOGIN")
 f:SetScript("OnEvent", function(_, event, ...)
+  if event == "PLAYER_LOGIN" then
+    -- If the AH is already open after /reload, AUCTION_HOUSE_SHOW may not fire.
+    local parent = getAHParentFrame()
+    if parent and parent.IsShown and parent:IsShown() then
+      ensureAHButtons()
+    end
+    return
+  end
+
+  if event == "AUCTION_HOUSE_SHOW" then
+    ensureAHButtons()
+    return
+  end
+
   if event == "REPLICATE_ITEM_LIST_UPDATE" then
     -- This event can fire for reasons other than our scan request.
     -- Only act if we're waiting for a scan result (scanProgress) or pipeline is waiting.
@@ -932,6 +1131,9 @@ f:SetScript("OnEvent", function(_, event, ...)
     end
 
     stopScanProgress()
+
+    -- Record the last *successful* scan readiness time so we can warn about the ~15 minute throttle window.
+    AuctionExportDB.lastSuccessfulReplicateAt = time()
 
     if isActiveJob("pipeline") and activeJob.stage == "waiting_scan" then
       local via = activeJob.scanReadyViaPoll and " (detected via poll)" or ""

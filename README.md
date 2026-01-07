@@ -5,7 +5,12 @@ Small WoW addon to export Auction House replicate data to SavedVariables.
 ## Usage
 
 1. Open the Auction House.
-2. Run `/ahexport` to run the full pipeline (scan → read → enrich missing item info).
+2. Click the **Start** button in the Auction House UI (or run `/ahexport`) to run the full pipeline (scan → read → enrich missing item info).
+
+Notes:
+
+- A **Stop** button is available in the Auction House UI to cancel an in-progress job.
+- If your last successful replicate scan was within ~15 minutes, the addon shows a confirmation popup with a countdown and two choices: **Still try** or **Ok I'll wait**.
 
 Manual (debug/troubleshooting) flow:
 
